@@ -14,7 +14,7 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.concurrent.ScheduledExecutorService;
 
-record RaplDomainPaths(String name, Path energyPath, Path dramEnergyPath, Path namePath) {
+record RaplDomainPaths(String domainName, Path energyPath, Path dramEnergyPath, Path namePath) {
 }
 
 @ApplicationScoped
@@ -84,7 +84,15 @@ public class RaplReader implements QuarkusApplication {
                     }
                     // Only include domains where energyPath and namePath exist (dramEnergyPath is optional)
                     if (Files.exists(energyPath) && Files.exists(namePath)) {
-                        return new RaplDomainPaths(domain, energyPath, dramEnergyPath, namePath);
+
+                        // Read the name of the RAPL domain
+                        try {
+                            String domainName = readFile(namePath);
+                            return new RaplDomainPaths(domainName, energyPath, dramEnergyPath, namePath);
+                        } catch (IOException e) {
+                            throw new RuntimeException(e);
+                        }
+
                     }
                     return null;
                 })
@@ -96,9 +104,6 @@ public class RaplReader implements QuarkusApplication {
         long timestamp = System.currentTimeMillis();
 
         for (RaplDomainPaths domain : raplDomains) {
-            // Read the name of the RAPL domain
-            String domainName = readFile(domain.namePath());
-
             // Read the energy consumption data
             String energyUj = readFile(domain.energyPath());
 
@@ -110,7 +115,7 @@ public class RaplReader implements QuarkusApplication {
             if (energyUj != null) {
                 String output = String.join(COMMA_SEPERATOR,
                         String.valueOf(timestamp),
-                        domainName,
+                        domain.domainName(),
                         energyUj,
                         dramEnergyUj);
                 System.out.println(output);
