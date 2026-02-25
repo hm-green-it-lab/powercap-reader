@@ -12,16 +12,13 @@ A Java-based tool to read power consumption from RAPL interfaces via the Linux p
 Set measurement interval in `application.properties`:
 
 ```properties
-powercap.cron=*/1 * * * * ?
+powercap.interval.ms=100
 ```
-
-> [!warning]
-> A value less than one second may not be supported by the underlying scheduler implementation. In that case a warning message is logged during build and application start. Check https://quarkus.io/guides/scheduler-reference
 
 You can override this setting at runtime using a JVM parameter:
 
 ```bash
-java -Dpowercap.cron=""*/5 * * * * ? -jar powercap-reader-[version]-runner.jar
+java -Dpowercap.interval.ms=1000 -jar powercap-reader-[version]-runner.jar
 ```
 
 ### Measurement Mode
