@@ -4,7 +4,6 @@ import io.quarkus.runtime.Quarkus;
 import io.quarkus.runtime.QuarkusApplication;
 import io.quarkus.runtime.annotations.QuarkusMain;
 import jakarta.enterprise.context.ApplicationScoped;
-import jakarta.inject.Inject;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
 
 import java.io.BufferedReader;
@@ -12,8 +11,11 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
-import java.util.concurrent.ScheduledExecutorService;
+import java.util.Objects;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.LockSupport;
 
 record RaplDomainPaths(String domainName, Path energyPath, Path dramEnergyPath, Path namePath) {
 }
@@ -26,12 +28,18 @@ public class RaplReader implements QuarkusApplication {
 
     private static final String COMMA_SEPERATOR = ",";
 
+    private static final String POISON_PILL = "__STOP_WRITER__";
+
+    private static final long PARK_THRESHOLD_NS = 50_000L;
+
+    private static final long PARK_SAFETY_MARGIN_NS = 20_000L;
+
+    private static final int OUTPUT_QUEUE_CAPACITY = 8192;
+
     private static final Path raplBasePath = Path.of("/sys/class/powercap/intel-rapl");
-
+    private final BlockingQueue<String> outputQueue = new ArrayBlockingQueue<>(OUTPUT_QUEUE_CAPACITY);
     private List<RaplDomainPaths> raplDomains;
-
-    @Inject
-    private ScheduledExecutorService scheduledExecutorService;
+    private long droppedLines;
 
     @ConfigProperty(name = "powercap.interval.ms", defaultValue = "1000.0")
     private double powerCapIntervalMs;
@@ -55,55 +63,112 @@ public class RaplReader implements QuarkusApplication {
         // Print CSV header for raw mode
         System.out.println("Timestamp,Domain, Energy (micro joules), DRAM Energy (micro joules)");
 
-        double powerCapIntervalMicroseconds = powerCapIntervalMs * 1_000;
-        long powerCapIntervalMicroSecondsLong = Math.round(powerCapIntervalMicroseconds);
-        scheduledExecutorService.scheduleAtFixedRate(() -> {
-            try {
-                readPowercapDataAndWriteTofiles();
-            } catch (IOException e) {
-                e.printStackTrace();
-            }
-        }, 0, powerCapIntervalMicroSecondsLong, TimeUnit.MICROSECONDS);
+        long intervalNs = resolveSamplingIntervalNs();
+        Thread writerThread = startWriterThread();
 
-        // Keep application running
-        while (true) {
-            Thread.sleep(60000);
+        try {
+            runSamplingLoop(intervalNs);
+        } finally {
+            stopWriterThread(writerThread);
+        }
+
+        return 0;
+    }
+
+    private long resolveSamplingIntervalNs() {
+        return Math.max(1L, Math.round(powerCapIntervalMs * 1_000_000.0d));
+    }
+
+    private Thread startWriterThread() {
+        Thread writerThread = new Thread(() -> {
+            try {
+                while (true) {
+                    String output = outputQueue.take();
+                    if (POISON_PILL.equals(output)) {
+                        return;
+                    }
+                    System.out.println(output);
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }, "powercap-writer");
+        writerThread.setDaemon(true);
+        writerThread.start();
+        return writerThread;
+    }
+
+    private void runSamplingLoop(long intervalNs) {
+        long nextDeadlineNs = System.nanoTime();
+        while (!Thread.currentThread().isInterrupted()) {
+            nextDeadlineNs += intervalNs;
+
+            try {
+                readPowercapDataAndWriteToQueue();
+            } catch (IOException e) {
+                System.err.println("Failed to read powercap data: " + e.getMessage());
+            }
+
+            waitUntil(nextDeadlineNs);
+        }
+    }
+
+    private void waitUntil(long deadlineNs) {
+        long remainingNs;
+        while ((remainingNs = deadlineNs - System.nanoTime()) > 0) {
+            if (remainingNs > PARK_THRESHOLD_NS) {
+                LockSupport.parkNanos(remainingNs - PARK_SAFETY_MARGIN_NS);
+            } else {
+                Thread.onSpinWait();
+            }
+        }
+    }
+
+    private void stopWriterThread(Thread writerThread) throws InterruptedException {
+        while (!outputQueue.offer(POISON_PILL, 100, TimeUnit.MILLISECONDS)) {
+            Thread.onSpinWait();
+        }
+        writerThread.join(1000);
+        if (droppedLines > 0) {
+            System.err.println("Dropped output lines due to full queue: " + droppedLines);
         }
     }
 
     // Load available RAPL domains from sysfs and create paths data structure
     private void initializeRaplDomains() throws IOException {
-        raplDomains = Files.list(raplBasePath)
-                .filter(Files::isDirectory)
-                .map(path -> path.getFileName().toString())
-                .filter(name -> name.startsWith("intel-rapl:"))
-                .map(domain -> {
-                    Path energyPath = raplBasePath.resolve(domain).resolve("energy_uj");
-                    Path dramEnergyPath = raplBasePath.resolve(domain).resolve(domain + ":0").resolve("energy_uj");
-                    Path namePath = raplBasePath.resolve(domain).resolve("name");
+        try (var raplDomainStream = Files.list(raplBasePath)) {
+            raplDomains = raplDomainStream
+                    .filter(Files::isDirectory)
+                    .map(path -> path.getFileName().toString())
+                    .filter(name -> name.startsWith("intel-rapl:"))
+                    .map(domain -> {
+                        Path energyPath = raplBasePath.resolve(domain).resolve("energy_uj");
+                        Path dramEnergyPath = raplBasePath.resolve(domain).resolve(domain + ":0").resolve("energy_uj");
+                        Path namePath = raplBasePath.resolve(domain).resolve("name");
 
-                    if (!Files.exists(dramEnergyPath)) {
-                        dramEnergyPath = null;
-                    }
-                    // Only include domains where energyPath and namePath exist (dramEnergyPath is optional)
-                    if (Files.exists(energyPath) && Files.exists(namePath)) {
-
-                        // Read the name of the RAPL domain
-                        try {
-                            String domainName = readFile(namePath);
-                            return new RaplDomainPaths(domainName, energyPath, dramEnergyPath, namePath);
-                        } catch (IOException e) {
-                            throw new RuntimeException(e);
+                        if (!Files.exists(dramEnergyPath)) {
+                            dramEnergyPath = null;
                         }
+                        // Only include domains where energyPath and namePath exist (dramEnergyPath is optional)
+                        if (Files.exists(energyPath) && Files.exists(namePath)) {
 
-                    }
-                    return null;
-                })
-                .filter(domainPaths -> domainPaths != null)
-                .toList();
+                            // Read the name of the RAPL domain
+                            try {
+                                String domainName = readFile(namePath);
+                                return new RaplDomainPaths(domainName, energyPath, dramEnergyPath, namePath);
+                            } catch (IOException e) {
+                                throw new RuntimeException(e);
+                            }
+
+                        }
+                        return null;
+                    })
+                    .filter(Objects::nonNull)
+                    .toList();
+        }
     }
 
-    void readPowercapDataAndWriteTofiles() throws IOException {
+    void readPowercapDataAndWriteToQueue() throws IOException {
         long timestamp = System.nanoTime();
 
         for (RaplDomainPaths domain : raplDomains) {
@@ -121,7 +186,11 @@ public class RaplReader implements QuarkusApplication {
                         domain.domainName(),
                         energyUj,
                         dramEnergyUj);
-                System.out.println(output);
+
+                // Avoid blocking the sampling loop on stdout when running high-frequency intervals.
+                if (!outputQueue.offer(output)) {
+                    droppedLines++;
+                }
             }
         }
     }

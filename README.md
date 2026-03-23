@@ -21,7 +21,7 @@ You can override this setting at runtime using a JVM parameter:
 java -Dpowercap.interval.ms=1000.0 -jar powercap-reader-[version]-runner.jar
 ```
 
-The interval is specified in milliseconds (ms) and determines how often energy readings are logged. The default value is 100 ms, but it can be adjusted based on the desired granularity of measurements. Internally, the interval is converted to microseconds (µs) for scheduling purposes, as the application uses a high-resolution timer to trigger energy readings. Therefore, the lowest possible interval is 1 µs (0.001 ms).
+The interval is specified in milliseconds (ms) and determines how often energy readings are logged. The default value is 100 ms, but it can be adjusted based on the desired granularity of measurements. Internally, the interval is converted to nanoseconds for scheduling purposes, as the application uses a high-resolution timer to trigger energy readings. 
 
 ### Measurement Mode
 
