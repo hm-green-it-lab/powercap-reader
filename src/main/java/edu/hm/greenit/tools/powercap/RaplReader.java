@@ -13,6 +13,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
 record RaplDomainPaths(String domainName, Path energyPath, Path dramEnergyPath, Path namePath) {
 }
@@ -32,8 +33,8 @@ public class RaplReader implements QuarkusApplication {
     @Inject
     private ScheduledExecutorService scheduledExecutorService;
 
-    @ConfigProperty(name = "powercap.interval.ms", defaultValue = "1000")
-    private long powerCapIntervalMs;
+    @ConfigProperty(name = "powercap.interval.ms", defaultValue = "1000.0")
+    private double powerCapIntervalMs;
 
     public static void main(String[] args) {
         Quarkus.run(RaplReader.class, args);
@@ -54,13 +55,15 @@ public class RaplReader implements QuarkusApplication {
         // Print CSV header for raw mode
         System.out.println("Timestamp,Domain, Energy (micro joules), DRAM Energy (micro joules)");
 
+        double powerCapIntervalMicroseconds = powerCapIntervalMs * 1_000;
+        long powerCapIntervalMicroSecondsLong = Math.round(powerCapIntervalMicroseconds);
         scheduledExecutorService.scheduleAtFixedRate(() -> {
             try {
                 readPowercapDataAndWriteTofiles();
             } catch (IOException e) {
                 e.printStackTrace();
             }
-        }, 0, powerCapIntervalMs, java.util.concurrent.TimeUnit.MILLISECONDS);
+        }, 0, powerCapIntervalMicroSecondsLong, TimeUnit.MICROSECONDS);
 
         // Keep application running
         while (true) {
@@ -101,7 +104,7 @@ public class RaplReader implements QuarkusApplication {
     }
 
     void readPowercapDataAndWriteTofiles() throws IOException {
-        long timestamp = System.currentTimeMillis();
+        long timestamp = System.nanoTime();
 
         for (RaplDomainPaths domain : raplDomains) {
             // Read the energy consumption data
