@@ -12,14 +12,16 @@ A Java-based tool to read power consumption from RAPL interfaces via the Linux p
 Set measurement interval in `application.properties`:
 
 ```properties
-powercap.interval.ms=100
+powercap.interval.ms=100.0
 ```
 
 You can override this setting at runtime using a JVM parameter:
 
 ```bash
-java -Dpowercap.interval.ms=1000 -jar powercap-reader-[version]-runner.jar
+java -Dpowercap.interval.ms=1000.0 -jar powercap-reader-[version]-runner.jar
 ```
+
+The interval is specified in milliseconds (ms) and determines how often energy readings are logged. The default value is 100 ms, but it can be adjusted based on the desired granularity of measurements. Internally, the interval is converted to nanoseconds for scheduling purposes, as the application uses a high-resolution timer to trigger energy readings. 
 
 ### Measurement Mode
 
@@ -42,17 +44,19 @@ Example Output:
 
 ```text
 Timestamp,Domain,Energy (micro joules), DRAM Energy (micro joules)
-1746240000000,package-0,12345678,4567890
-1746240010000,package-0,12349999,4572100
+527041666265300,package-0,12345678,4567890
+527041666265400,package-0,12349999,4572100
 ...
 ```
 
 ## Notes
 
+- The Timestamp is provided in nanoseconds resolution but not necessarily in nanosecond precision. It is intended to provide a high-resolution timestamp for each reading, but the actual precision may vary based on the underlying hardware and operating system scheduling.
 - RAPL provides cumulative energy readings.
 - The DRAM domain is optional and may not be supported on all systems.
 - Output is printed to stdout and can be redirected or processed by orchestration layers.
 - This tool does not write CSV files itself.
+
 
 
 
