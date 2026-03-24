@@ -20,15 +20,19 @@ import java.util.concurrent.locks.LockSupport;
 record RaplDomainPaths(String domainName, Path energyPath, Path dramEnergyPath, Path namePath) {
 }
 
+record SampleRow(long epochTimestampMs, long timestampNs, String domainName, String energyUj, String dramEnergyUj) {
+    String toCsv() {
+        return String.join(RaplReader.COMMA_SEPERATOR, String.valueOf(epochTimestampMs), String.valueOf(timestampNs), domainName, energyUj, dramEnergyUj);
+    }
+}
+
 @ApplicationScoped
 @QuarkusMain
 public class RaplReader implements QuarkusApplication {
 
+    static final String COMMA_SEPERATOR = ",";
     private static final String MINUS_ONE_VALUE = "-1";
-
-    private static final String COMMA_SEPERATOR = ",";
-
-    private static final String POISON_PILL = "__STOP_WRITER__";
+    private static final SampleRow POISON_PILL = new SampleRow(Long.MIN_VALUE, Long.MIN_VALUE, "", "", "");
 
     private static final long PARK_THRESHOLD_NS = 50_000L;
 
@@ -37,7 +41,7 @@ public class RaplReader implements QuarkusApplication {
     private static final int OUTPUT_QUEUE_CAPACITY = 8192;
 
     private static final Path raplBasePath = Path.of("/sys/class/powercap/intel-rapl");
-    private final BlockingQueue<String> outputQueue = new ArrayBlockingQueue<>(OUTPUT_QUEUE_CAPACITY);
+    private final BlockingQueue<SampleRow> outputQueue = new ArrayBlockingQueue<>(OUTPUT_QUEUE_CAPACITY);
     private List<RaplDomainPaths> raplDomains;
     private long droppedLines;
 
@@ -83,11 +87,11 @@ public class RaplReader implements QuarkusApplication {
         Thread writerThread = new Thread(() -> {
             try {
                 while (true) {
-                    String output = outputQueue.take();
-                    if (POISON_PILL.equals(output)) {
+                    SampleRow output = outputQueue.take();
+                    if (output == POISON_PILL) {
                         return;
                     }
-                    System.out.println(output);
+                    System.out.println(output.toCsv());
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -169,7 +173,8 @@ public class RaplReader implements QuarkusApplication {
     }
 
     void readPowercapDataAndWriteToQueue() throws IOException {
-        long timestamp = System.nanoTime();
+        long epochTimeStampMs = System.currentTimeMillis();
+        long nsTimestamp = System.nanoTime();
 
         for (RaplDomainPaths domain : raplDomains) {
             // Read the energy consumption data
@@ -181,8 +186,8 @@ public class RaplReader implements QuarkusApplication {
                     : MINUS_ONE_VALUE;
 
             if (energyUj != null) {
-                String output = String.join(COMMA_SEPERATOR,
-                        String.valueOf(timestamp),
+                // Queue raw values and defer CSV creation to the writer thread to keep sampling timing stable.
+                SampleRow output = new SampleRow(epochTimeStampMs, nsTimestamp,
                         domain.domainName(),
                         energyUj,
                         dramEnergyUj);
