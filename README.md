@@ -43,15 +43,15 @@ java -jar target/powercap-reader-[version]-runner.jar
 Example Output:
 
 ```text
-Timestamp,Domain,Energy (micro joules), DRAM Energy (micro joules)
-527041666265300,package-0,12345678,4567890
-527041666265400,package-0,12349999,4572100
+EpochTimestampMilliSeconds,TimestampNanoSeconds,Domain,Energy (micro joules),DRAM Energy (micro joules)
+1774351404175,527041666265300,package-0,12345678,4567890
+1774351404175,527041666265400,package-0,12349999,4572100
 ...
 ```
 
 ## Notes
 
-- The Timestamp is provided in nanoseconds resolution but not necessarily in nanosecond precision. It is intended to provide a high-resolution timestamp for each reading, but the actual precision may vary based on the underlying hardware and operating system scheduling.
+- The TimestampNanoSeconds is provided in nanoseconds resolution but not necessarily in nanosecond precision. It is intended to provide a high-resolution timestamp for each reading, but the actual precision may vary based on the underlying hardware and operating system scheduling.
 - RAPL provides cumulative energy readings.
 - The DRAM domain is optional and may not be supported on all systems.
 - Output is printed to stdout and can be redirected or processed by orchestration layers.

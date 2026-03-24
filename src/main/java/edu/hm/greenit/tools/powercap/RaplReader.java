@@ -65,7 +65,7 @@ public class RaplReader implements QuarkusApplication {
         initializeRaplDomains();
 
         // Print CSV header for raw mode
-        System.out.println("Timestamp,Domain, Energy (micro joules), DRAM Energy (micro joules)");
+        System.out.println("EpochTimestampMilliSeconds,TimestampNanoSeconds,Domain,Energy (micro joules),DRAM Energy (micro joules)");
 
         long intervalNs = resolveSamplingIntervalNs();
         Thread writerThread = startWriterThread();
