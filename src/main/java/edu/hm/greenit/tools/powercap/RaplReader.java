@@ -7,9 +7,13 @@ import jakarta.enterprise.context.ApplicationScoped;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
 
 import java.io.BufferedReader;
+import java.io.Closeable;
 import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.ArrayBlockingQueue;
@@ -17,12 +21,9 @@ import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.LockSupport;
 
-record RaplDomainPaths(String domainName, Path energyPath, Path dramEnergyPath, Path namePath) {
-}
-
-record SampleRow(long epochTimestampMs, long timestampNs, String domainName, String energyUj, String dramEnergyUj) {
+record SampleRow(long epochTimestampMs, long timestampNs, String domainName, long energyUj, long dramEnergyUj) {
     String toCsv() {
-        return String.join(RaplReader.COMMA_SEPERATOR, String.valueOf(epochTimestampMs), String.valueOf(timestampNs), domainName, energyUj, dramEnergyUj);
+        return String.join(RaplReader.COMMA_SEPERATOR, String.valueOf(epochTimestampMs), String.valueOf(timestampNs), domainName, String.valueOf(energyUj), String.valueOf(dramEnergyUj));
     }
 }
 
@@ -31,32 +32,81 @@ record SampleRow(long epochTimestampMs, long timestampNs, String domainName, Str
 public class RaplReader implements QuarkusApplication {
 
     static final String COMMA_SEPERATOR = ",";
-    private static final String MINUS_ONE_VALUE = "-1";
-    private static final SampleRow POISON_PILL = new SampleRow(Long.MIN_VALUE, Long.MIN_VALUE, "", "", "");
+    private static final long MINUS_ONE_VALUE = -1L;
+    private static final SampleRow POISON_PILL = new SampleRow(Long.MIN_VALUE, Long.MIN_VALUE, "", Long.MIN_VALUE, Long.MIN_VALUE);
 
     private static final long PARK_THRESHOLD_NS = 50_000L;
-
     private static final long PARK_SAFETY_MARGIN_NS = 20_000L;
-
     private static final int OUTPUT_QUEUE_CAPACITY = 8192;
+
+    /** Max byte length of an energy_uj value: 20 digits + newline, rounded up. */
+    private static final int READ_BUFFER_SIZE = 24;
 
     private static final Path raplBasePath = Path.of("/sys/class/powercap/intel-rapl");
     private final BlockingQueue<SampleRow> outputQueue = new ArrayBlockingQueue<>(OUTPUT_QUEUE_CAPACITY);
-    private List<RaplDomainPaths> raplDomains;
+    private List<RaplDomain> raplDomains;
     private long droppedLines;
 
     @ConfigProperty(name = "powercap.interval.ms", defaultValue = "1000.0")
     private double powerCapIntervalMs;
 
+    // ---------------------------------------------------------------------------
+    // Runtime domain: holds pre-opened FileChannels and a reused ByteBuffer so
+    // that each sample only needs a single pread() syscall per file — no open/
+    // close overhead and no ephemeral object allocation on the hot path.
+    // ---------------------------------------------------------------------------
+    private static final class RaplDomain implements Closeable {
+        final String domainName;
+        final FileChannel energyChannel;
+        final FileChannel dramEnergyChannel; // nullable
+        // Direct buffer avoids an internal JVM copy when calling FileChannel.read()
+        final ByteBuffer buffer = ByteBuffer.allocateDirect(READ_BUFFER_SIZE);
+
+        RaplDomain(String domainName, FileChannel energyChannel, FileChannel dramEnergyChannel) {
+            this.domainName = domainName;
+            this.energyChannel = energyChannel;
+            this.dramEnergyChannel = dramEnergyChannel;
+        }
+
+        @Override
+        public void close() throws IOException {
+            energyChannel.close();
+            if (dramEnergyChannel != null) {
+                dramEnergyChannel.close();
+            }
+        }
+    }
+
     public static void main(String[] args) {
         Quarkus.run(RaplReader.class, args);
     }
 
-    // Reads a single line from a file if it exists
+    // Used only during initialisation to read the domain name (a string, not a number).
     private static String readFile(Path path) throws IOException {
         try (BufferedReader reader = Files.newBufferedReader(path)) {
             return reader.readLine();
         }
+    }
+
+    /**
+     * Reads an ASCII decimal integer from a sysfs file using a pre-opened
+     * FileChannel.  Reading from position 0 via pread() always returns fresh
+     * kernel-generated data without reopening the file.
+     */
+    private static long readLong(FileChannel channel, ByteBuffer buffer) throws IOException {
+        buffer.clear();
+        channel.read(buffer, 0L);
+        buffer.flip();
+        long value = 0L;
+        while (buffer.hasRemaining()) {
+            byte b = buffer.get();
+            if (b >= '0' && b <= '9') {
+                value = value * 10 + (b - '0');
+            } else {
+                break; // newline or end of content
+            }
+        }
+        return value;
     }
 
     @Override
@@ -74,6 +124,12 @@ public class RaplReader implements QuarkusApplication {
             runSamplingLoop(intervalNs);
         } finally {
             stopWriterThread(writerThread);
+            for (RaplDomain domain : raplDomains) {
+                try {
+                    domain.close();
+                } catch (IOException ignored) {
+                }
+            }
         }
 
         return 0;
@@ -138,7 +194,7 @@ public class RaplReader implements QuarkusApplication {
         }
     }
 
-    // Load available RAPL domains from sysfs and create paths data structure
+    // Load available RAPL domains from sysfs, open FileChannels, and build the runtime domain list.
     private void initializeRaplDomains() throws IOException {
         try (var raplDomainStream = Files.list(raplBasePath)) {
             raplDomains = raplDomainStream
@@ -153,17 +209,17 @@ public class RaplReader implements QuarkusApplication {
                         if (!Files.exists(dramEnergyPath)) {
                             dramEnergyPath = null;
                         }
-                        // Only include domains where energyPath and namePath exist (dramEnergyPath is optional)
                         if (Files.exists(energyPath) && Files.exists(namePath)) {
-
-                            // Read the name of the RAPL domain
                             try {
                                 String domainName = readFile(namePath);
-                                return new RaplDomainPaths(domainName, energyPath, dramEnergyPath, namePath);
+                                FileChannel energyChannel = FileChannel.open(energyPath, StandardOpenOption.READ);
+                                FileChannel dramChannel = dramEnergyPath != null
+                                        ? FileChannel.open(dramEnergyPath, StandardOpenOption.READ)
+                                        : null;
+                                return new RaplDomain(domainName, energyChannel, dramChannel);
                             } catch (IOException e) {
                                 throw new RuntimeException(e);
                             }
-
                         }
                         return null;
                     })
@@ -176,27 +232,21 @@ public class RaplReader implements QuarkusApplication {
         long epochTimeStampMs = System.currentTimeMillis();
         long nsTimestamp = System.nanoTime();
 
-        for (RaplDomainPaths domain : raplDomains) {
-            // Read the energy consumption data
-            String energyUj = readFile(domain.energyPath());
+        for (RaplDomain domain : raplDomains) {
+            // Re-read from position 0: pread() always returns fresh sysfs data
+            long energyUj = readLong(domain.energyChannel, domain.buffer);
 
-            // Read DRAM energy if the path exists
-            String dramEnergyUj = domain.dramEnergyPath() != null
-                    ? readFile(domain.dramEnergyPath())
+            long dramEnergyUj = domain.dramEnergyChannel != null
+                    ? readLong(domain.dramEnergyChannel, domain.buffer)
                     : MINUS_ONE_VALUE;
 
-            if (energyUj != null) {
-                // Queue raw values and defer CSV creation to the writer thread to keep sampling timing stable.
-                SampleRow output = new SampleRow(epochTimeStampMs, nsTimestamp,
-                        domain.domainName(),
-                        energyUj,
-                        dramEnergyUj);
+            SampleRow output = new SampleRow(epochTimeStampMs, nsTimestamp,
+                    domain.domainName, energyUj, dramEnergyUj);
 
-                // Avoid blocking the sampling loop on stdout when running high-frequency intervals.
-                if (!outputQueue.offer(output)) {
-                    droppedLines++;
-                }
+            if (!outputQueue.offer(output)) {
+                droppedLines++;
             }
         }
     }
 }
+
